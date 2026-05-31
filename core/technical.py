@@ -1,0 +1,389 @@
+"""技术指标计算 — 分型/金叉死叉/中枢/缩量判断/MACD"""
+
+from typing import Optional, Tuple
+import numpy as np
+from data.models import KLineData
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+def calc_ma(closes: np.ndarray, period: int) -> np.ndarray:
+    """计算移动平均线 (SMA)"""
+    if len(closes) < period:
+        return np.full_like(closes, np.nan, dtype=float)
+    ma = np.full_like(closes, np.nan, dtype=float)
+    cumsum = np.cumsum(np.insert(closes, 0, 0))
+    ma[period - 1:] = (cumsum[period:] - cumsum[:-period]) / period
+    return ma
+
+
+def calc_ema(closes: np.ndarray, period: int) -> np.ndarray:
+    """计算指数移动平均线 (EMA)"""
+    if len(closes) < 2:
+        return np.array(closes, dtype=float)
+    ema = np.full_like(closes, np.nan, dtype=float)
+    ema[0] = closes[0]
+    alpha = 2.0 / (period + 1)
+    for i in range(1, len(closes)):
+        ema[i] = alpha * closes[i] + (1 - alpha) * ema[i - 1]
+    return ema
+
+
+def calc_macd(
+    closes: np.ndarray,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    计算MACD指标
+    返回: (DIF, DEA, MACD柱)
+    """
+    if len(closes) < slow:
+        empty = np.full_like(closes, np.nan, dtype=float)
+        return empty, empty, empty
+
+    ema_fast = calc_ema(closes, fast)
+    ema_slow = calc_ema(closes, slow)
+    dif = ema_fast - ema_slow
+    dea = calc_ema(dif, signal)
+    macd_bar = 2 * (dif - dea)
+
+    return dif, dea, macd_bar
+
+
+# ============================================================
+# 分型检测 (Fractal Detection) — 缠论标准分型
+# ============================================================
+
+def _merge_contains(highs: np.ndarray, lows: np.ndarray) -> Tuple[list, list]:
+    """
+    K线包含处理（向上/向下）
+    将存在包含关系的K线合并为单根K线
+    返回: (merged_highs, merged_lows)
+    """
+    n = len(highs)
+    if n < 2:
+        return list(highs), list(lows)
+
+    m_highs = [highs[0]]
+    m_lows = [lows[0]]
+    direction = 0  # 0=unknown, 1=up, -1=down
+
+    for i in range(1, n):
+        prev_h, prev_l = m_highs[-1], m_lows[-1]
+        cur_h, cur_l = highs[i], lows[i]
+
+        # 判断包含关系
+        if (cur_h <= prev_h and cur_l >= prev_l) or (cur_h >= prev_h and cur_l <= prev_l):
+            if direction == 1 or (direction == 0 and cur_h > prev_h):
+                # 向上处理: 取高高, 高低
+                m_highs[-1] = max(prev_h, cur_h)
+                m_lows[-1] = max(prev_l, cur_l)
+                direction = 1
+            else:
+                # 向下处理: 取低高, 低低
+                m_highs[-1] = min(prev_h, cur_h)
+                m_lows[-1] = min(prev_l, cur_l)
+                direction = -1
+        else:
+            # 无包含关系
+            m_highs.append(cur_h)
+            m_lows.append(cur_l)
+            direction = 1 if cur_h > prev_h else -1
+
+    return m_highs, m_lows
+
+
+def detect_top_fractal(highs: np.ndarray, lows: np.ndarray) -> list[int]:
+    """
+    检测顶分型
+    先进行包含处理，然后在处理后序列中找顶分型
+    顶分型定义: 中间K线最高价 > 左K线最高价 且 > 右K线最高价,
+               且中间K线最低价 > 左K线最低价 且 > 右K线最低价
+    返回: 原始K线序列中顶分型所在的索引列表
+    """
+    n = len(highs)
+    if n < 3:
+        return []
+
+    m_highs, m_lows = _merge_contains(highs, lows)
+
+    merged_indices = []
+    for i in range(1, len(m_highs) - 1):
+        if (m_highs[i] > m_highs[i - 1] and m_highs[i] > m_highs[i + 1] and
+                m_lows[i] > m_lows[i - 1] and m_lows[i] > m_lows[i + 1]):
+            merged_indices.append(i)
+
+    # 映射回原始索引（近似）
+    top_fractals = []
+    for mi in merged_indices:
+        idx = min(mi * 2, n - 1) if len(m_highs) != n else mi
+        idx = min(idx, n - 1)
+        top_fractals.append(idx)
+
+    return top_fractals
+
+
+def detect_bottom_fractal(highs: np.ndarray, lows: np.ndarray) -> list[int]:
+    """
+    检测底分型
+    底分型定义: 中间K线最低价 < 左K线最低价 且 < 右K线最低价,
+               且中间K线最高价 < 左K线最高价 且 < 右K线最高价
+    返回: 原始K线序列中底分型所在的索引列表
+    """
+    n = len(highs)
+    if n < 3:
+        return []
+
+    m_highs, m_lows = _merge_contains(highs, lows)
+
+    merged_indices = []
+    for i in range(1, len(m_highs) - 1):
+        if (m_lows[i] < m_lows[i - 1] and m_lows[i] < m_lows[i + 1] and
+                m_highs[i] < m_highs[i - 1] and m_highs[i] < m_highs[i + 1]):
+            merged_indices.append(i)
+
+    bottom_fractals = []
+    for mi in merged_indices:
+        idx = min(mi * 2, n - 1) if len(m_highs) != n else mi
+        idx = min(idx, n - 1)
+        bottom_fractals.append(idx)
+
+    return bottom_fractals
+
+
+def get_latest_top_fractal(highs: np.ndarray, lows: np.ndarray) -> Tuple[bool, int, float]:
+    """
+    获取最近的顶分型
+    返回: (是否存在, 索引, 顶分型最高价)
+    """
+    tops = detect_top_fractal(highs, lows)
+    if tops:
+        idx = tops[-1]
+        return True, idx, float(highs[idx])
+    return False, -1, 0.0
+
+
+def get_latest_bottom_fractal(highs: np.ndarray, lows: np.ndarray) -> Tuple[bool, int]:
+    """获取最近的底分型
+    返回: (是否存在, 索引)
+    """
+    bottoms = detect_bottom_fractal(highs, lows)
+    if bottoms:
+        return True, bottoms[-1]
+    return False, -1
+
+
+# ============================================================
+# 金叉/死叉检测
+# ============================================================
+
+def detect_golden_cross(
+    closes: np.ndarray,
+    fast_period: int = 5,
+    slow_period: int = 10,
+    lookback: int = 3,
+) -> Tuple[bool, int]:
+    """
+    检测最近N日内是否发生SMA金叉 (快线上穿慢线)
+    返回: (是否金叉, 金叉发生日索引)
+    注意: 这是SMA均线金叉，需求要求MACD金叉请使用 detect_macd_golden_cross()
+    """
+    if len(closes) < slow_period + 1:
+        return False, -1
+
+    fast_ma = calc_ma(closes, fast_period)
+    slow_ma = calc_ma(closes, slow_period)
+
+    for i in range(len(closes) - 1, max(0, len(closes) - lookback - 1), -1):
+        if i < slow_period:
+            continue
+        if (not np.isnan(fast_ma[i]) and not np.isnan(slow_ma[i]) and
+                not np.isnan(fast_ma[i - 1]) and not np.isnan(slow_ma[i - 1])):
+            if fast_ma[i - 1] <= slow_ma[i - 1] and fast_ma[i] > slow_ma[i]:
+                return True, i
+
+    return False, -1
+
+
+def detect_macd_golden_cross(
+    closes: np.ndarray,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+    lookback: int = 3,
+) -> Tuple[bool, int]:
+    """
+    检测最近N日内是否发生MACD金叉 (DIF上穿DEA)
+    MACD金叉定义: 前一周期 DIF <= DEA, 当前周期 DIF > DEA
+    返回: (是否金叉, 金叉发生日索引)
+    """
+    if len(closes) < slow + signal + 1:
+        return False, -1
+
+    dif, dea, _ = calc_macd(closes, fast, slow, signal)
+
+    for i in range(len(closes) - 1, max(0, len(closes) - lookback - 1), -1):
+        if i < slow + signal:
+            continue
+        if (not np.isnan(dif[i]) and not np.isnan(dea[i]) and
+                not np.isnan(dif[i - 1]) and not np.isnan(dea[i - 1])):
+            if dif[i - 1] <= dea[i - 1] and dif[i] > dea[i]:
+                logger.debug(f"MACD金叉发生于索引 {i}")
+                return True, i
+
+    return False, -1
+
+
+def detect_death_cross(
+    closes: np.ndarray,
+    fast_period: int = 5,
+    slow_period: int = 10,
+    lookback: int = 3,
+) -> Tuple[bool, int]:
+    """
+    检测最近N日内是否发生死叉 (快线下穿慢线)
+    """
+    if len(closes) < slow_period + 1:
+        return False, -1
+
+    fast_ma = calc_ma(closes, fast_period)
+    slow_ma = calc_ma(closes, slow_period)
+
+    for i in range(len(closes) - 1, max(0, len(closes) - lookback - 1), -1):
+        if i < slow_period:
+            continue
+        if (not np.isnan(fast_ma[i]) and not np.isnan(slow_ma[i]) and
+                not np.isnan(fast_ma[i - 1]) and not np.isnan(slow_ma[i - 1])):
+            if fast_ma[i - 1] >= slow_ma[i - 1] and fast_ma[i] < slow_ma[i]:
+                return True, i
+
+    return False, -1
+
+
+# ============================================================
+# 中枢 (盘整区间) 计算
+# ============================================================
+
+def calc_center_range(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    lookback: int = 20,
+) -> Tuple[float, float]:
+    """
+    计算最近N根K线的中枢区间 (盘整区间)
+    中枢 = 最近N根K线中重叠最多的价格区间
+    简化算法: 取最近N根K线中的高点的下分位 和 低点的上分位
+    返回: (中枢上沿, 中枢下沿)
+    """
+    if len(highs) < lookback:
+        lookback = len(highs)
+
+    recent_highs = highs[-lookback:]
+    recent_lows = lows[-lookback:]
+
+    center_high = np.percentile(recent_highs, 75)
+    center_low = np.percentile(recent_lows, 25)
+
+    if center_high - center_low < (center_high + center_low) / 2 * 0.01:
+        center_high = np.percentile(recent_highs, 90)
+        center_low = np.percentile(recent_lows, 10)
+
+    return round(float(center_high), 2), round(float(center_low), 2)
+
+
+def check_pullback_to_center(
+    close: float,
+    center_high: float,
+    center_low: float,
+    tolerance: float = 0.02,
+) -> bool:
+    """
+    检查当前价格是否回踩到中枢区间
+    tolerance: 允许的容差比例 (2%表示可以稍微超出中枢)
+    """
+    upper = center_high * (1 + tolerance)
+    lower = center_low * (1 - tolerance)
+    return lower <= close <= upper
+
+
+# ============================================================
+# 成交量分析
+# ============================================================
+
+def is_volume_contraction(
+    volumes: np.ndarray,
+    period: int = 5,
+    ratio: float = 0.7,
+) -> bool:
+    """
+    判断最近一根K线是否缩量
+    缩量定义: 当前成交量 < 前N根均量 * ratio
+    """
+    if len(volumes) < period + 1:
+        return False
+
+    current_vol = volumes[-1]
+    prev_avg_vol = np.mean(volumes[-(period + 1):-1])
+
+    if prev_avg_vol == 0:
+        return False
+
+    return current_vol < prev_avg_vol * ratio
+
+
+def is_volume_expansion(
+    volumes: np.ndarray,
+    period: int = 5,
+    ratio: float = 1.5,
+) -> bool:
+    """判断最近一根K线是否放量"""
+    if len(volumes) < period + 1:
+        return False
+
+    current_vol = volumes[-1]
+    prev_avg_vol = np.mean(volumes[-(period + 1):-1])
+
+    if prev_avg_vol == 0:
+        return False
+
+    return current_vol > prev_avg_vol * ratio
+
+
+# ============================================================
+# K线数据转换工具
+# ============================================================
+
+def kline_to_arrays(kline_list: list[KLineData]) -> dict:
+    """将KLineData列表转为numpy数组"""
+    if not kline_list:
+        return {
+            "dates": np.array([]), "opens": np.array([]),
+            "highs": np.array([]), "lows": np.array([]),
+            "closes": np.array([]), "volumes": np.array([]),
+        }
+    return {
+        "dates": np.array([k.date for k in kline_list]),
+        "opens": np.array([k.open for k in kline_list], dtype=float),
+        "highs": np.array([k.high for k in kline_list], dtype=float),
+        "lows": np.array([k.low for k in kline_list], dtype=float),
+        "closes": np.array([k.close for k in kline_list], dtype=float),
+        "volumes": np.array([k.volume for k in kline_list], dtype=float),
+    }
+
+
+def find_stop_loss_price(daily_lows: np.ndarray, prev_stop: float = 0.0) -> float:
+    """
+    计算止损价
+    止损线 = max(昨日止损线, 今日最低价)
+    首次设置时(prev_stop=0): 使用最近一日最低价
+    """
+    if len(daily_lows) == 0:
+        return 0.0
+
+    today_low = daily_lows[-1]
+    if prev_stop <= 0:
+        return float(today_low)
+    return float(max(prev_stop, today_low))
