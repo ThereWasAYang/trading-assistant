@@ -78,9 +78,19 @@ def init_db():
             stock_code TEXT DEFAULT '',
             rule_text TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS stock_names (
+            code TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            updated_at TEXT DEFAULT (datetime('now','localtime'))
+        );
     """)
 
-    # 预设分组
+    # 预设分组 — 先建唯一索引防止重复
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_name_type
+        ON groups(name, type)
+    """)
     for i, (name, gtype) in enumerate(PRESET_GROUPS):
         cur.execute(
             "INSERT OR IGNORE INTO groups (name, type, sort_order) VALUES (?, ?, ?)",
@@ -455,3 +465,67 @@ def clear_manual_alert(code: str, field: str = "all") -> None:
     if field in ("tp", "all"):
         set_setting(f"manual_tp_active_{code}", "0")
         set_setting(f"manual_tp_{code}", "0")
+
+
+# ============================================================
+# 股票名称映射 (stock_names) — 持久化全市场名称，减少API调用
+# ============================================================
+
+def get_stock_name(code: str) -> Optional[str]:
+    """根据代码查名称，不存在返回 None"""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT name FROM stock_names WHERE code=?", (code,)
+    ).fetchone()
+    conn.close()
+    return row["name"] if row else None
+
+
+def search_stock_names(keyword: str, limit: int = 20) -> list[dict]:
+    """在本地库中按代码或名称模糊搜索"""
+    conn = _connect()
+    pattern = f"%{keyword}%"
+    rows = conn.execute(
+        "SELECT code, name FROM stock_names "
+        "WHERE code LIKE ? OR name LIKE ? "
+        "LIMIT ?",
+        (pattern, pattern, limit),
+    ).fetchall()
+    conn.close()
+    return [{"code": r["code"], "name": r["name"]} for r in rows]
+
+
+def get_stock_names_count() -> int:
+    """获取已缓存的名称数量"""
+    conn = _connect()
+    row = conn.execute("SELECT COUNT(*) as cnt FROM stock_names").fetchone()
+    conn.close()
+    return row["cnt"] if row else 0
+
+
+def save_stock_names_batch(names: list[dict]) -> int:
+    """批量保存名称映射 [{code, name}, ...]，返回新增/更新数量"""
+    conn = _connect()
+    count = 0
+    for item in names:
+        cur = conn.execute(
+            "INSERT OR REPLACE INTO stock_names (code, name, updated_at) "
+            "VALUES (?, ?, datetime('now','localtime'))",
+            (item["code"], item["name"]),
+        )
+        count += cur.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
+def update_stock_name(code: str, name: str) -> None:
+    """更新单条名称"""
+    conn = _connect()
+    conn.execute(
+        "INSERT OR REPLACE INTO stock_names (code, name, updated_at) "
+        "VALUES (?, ?, datetime('now','localtime'))",
+        (code, name),
+    )
+    conn.commit()
+    conn.close()

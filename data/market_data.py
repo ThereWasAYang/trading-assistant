@@ -6,7 +6,13 @@ from typing import Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+import traceback
+
 from data.models import RealtimeQuote, KLineData
+from data.database import (
+    get_stock_name, search_stock_names, get_stock_names_count,
+    save_stock_names_batch, update_stock_name,
+)
 from utils.logger import get_logger
 from utils.cache import (
     get_quotes_cache, get_kline_cache, get_search_cache, get_30min_cache,
@@ -39,10 +45,11 @@ def _safe_int(val, default=0) -> int:
 
 def fetch_realtime_quotes(codes: Optional[list[str]] = None) -> dict[str, RealtimeQuote]:
     """
-    获取A股实时行情 (批量，带缓存)
-    使用 AKShare stock_zh_a_spot_em() 获取全市场数据后过滤
+    获取A股实时行情 (批量，带缓存 + 多源切换)
+    先尝试新浪源，失败后尝试东方财富源
     返回: {code: RealtimeQuote}
     """
+    import time
     cache = get_quotes_cache()
     cache_key = "all_quotes"
 
@@ -53,51 +60,137 @@ def fetch_realtime_quotes(codes: Optional[list[str]] = None) -> dict[str, Realti
             return {c: cached_result[c] for c in codes if c in cached_result}
         return cached_result
 
-    try:
-        import akshare as ak
-        logger.debug("从AKShare获取全市场实时行情...")
-        df = ak.stock_zh_a_spot_em()
-
-        # 标准化列名
-        col_map = {
-            "代码": "code", "名称": "name", "最新价": "price",
-            "涨跌幅": "change_pct", "涨跌额": "change_amt",
-            "成交量": "volume", "成交额": "turnover",
-            "最高": "high", "最低": "low",
-            "今开": "open", "昨收": "pre_close",
-        }
-        df = df.rename(columns=col_map)
-        needed = list(col_map.values())
-        df = df[[c for c in needed if c in df.columns]]
-
-        result = {}
-        for _, row in df.iterrows():
-            code = str(row.get("code", ""))
-            if not code:
-                continue
-            result[code] = RealtimeQuote(
-                code=code,
-                name=str(row.get("name", "")),
-                price=_safe_float(row.get("price")),
-                change_pct=_safe_float(row.get("change_pct")),
-                change_amt=_safe_float(row.get("change_amt")),
-                volume=_safe_int(row.get("volume")),
-                turnover=_safe_float(row.get("turnover")),
-                high=_safe_float(row.get("high")),
-                low=_safe_float(row.get("low")),
-                open=_safe_float(row.get("open")),
-                pre_close=_safe_float(row.get("pre_close")),
-                timestamp=datetime.now().strftime("%H:%M:%S"),
-            )
-
-        # 缓存全市场数据
-        cache.set(cache_key, result, ttl=5.0)
-        logger.info(f"获取到 {len(result)} 只股票实时行情，缓存5秒")
-        return result
-
-    except Exception as e:
-        logger.error(f"获取实时行情失败: {e}")
+    result = _try_fetch_spot_sina(cache, cache_key)
+    if result is None:
+        result = _try_fetch_spot_em(cache, cache_key)
+    if result is None:
+        logger.error("所有行情数据源均不可用")
         return {}
+
+    logger.info(f"获取到 {len(result)} 只股票实时行情")
+    return result
+
+
+def _normalize_sina_code(raw_code: str) -> str:
+    """新浪代码格式 'sz000001' → '000001'"""
+    if len(raw_code) > 6 and raw_code[:2] in ("sz", "sh", "bj"):
+        return raw_code[2:]
+    return raw_code
+
+
+def _try_fetch_spot_sina(cache, cache_key: str) -> Optional[dict[str, RealtimeQuote]]:
+    """从新浪源获取全市场行情"""
+    import time
+    import akshare as ak
+
+    for attempt in range(2):
+        try:
+            logger.debug(f"从新浪源获取行情... (第{attempt+1}次)")
+            df = ak.stock_zh_a_spot()
+
+            col_map = {
+                "代码": "code", "名称": "name", "最新价": "price",
+                "涨跌幅": "change_pct", "涨跌额": "change_amt",
+                "成交量": "volume", "成交额": "turnover",
+                "最高": "high", "最低": "low",
+                "今开": "open", "昨收": "pre_close",
+            }
+            df = df.rename(columns=col_map)
+            needed = [c for c in col_map.values() if c in df.columns]
+
+            result = {}
+            for _, row in df.iterrows():
+                code = _normalize_sina_code(str(row.get("code", "")))
+                if not code:
+                    continue
+                result[code] = RealtimeQuote(
+                    code=code,
+                    name=str(row.get("name", "")),
+                    price=_safe_float(row.get("price")),
+                    change_pct=_safe_float(row.get("change_pct")),
+                    change_amt=_safe_float(row.get("change_amt")),
+                    volume=_safe_int(row.get("volume")),
+                    turnover=_safe_float(row.get("turnover")),
+                    high=_safe_float(row.get("high")),
+                    low=_safe_float(row.get("low")),
+                    open=_safe_float(row.get("open")),
+                    pre_close=_safe_float(row.get("pre_close")),
+                    timestamp=datetime.now().strftime("%H:%M:%S"),
+                )
+
+            cache.set(cache_key, result, ttl=10.0)
+            return result
+
+        except Exception as e:
+            logger.warning(f"新浪源行情失败 (第{attempt+1}/2次): {type(e).__name__}")
+            if attempt < 1:
+                time.sleep(3)
+
+    return None
+
+
+def _try_fetch_spot_em(cache, cache_key: str) -> Optional[dict[str, RealtimeQuote]]:
+    """从东方财富源获取全市场行情"""
+    import time
+    import akshare as ak
+
+    for attempt in range(2):
+        try:
+            logger.debug(f"从东方财富源获取行情... (第{attempt+1}次)")
+            df = ak.stock_zh_a_spot_em()
+
+            col_map = {
+                "代码": "code", "名称": "name", "最新价": "price",
+                "涨跌幅": "change_pct", "涨跌额": "change_amt",
+                "成交量": "volume", "成交额": "turnover",
+                "最高": "high", "最低": "low",
+                "今开": "open", "昨收": "pre_close",
+            }
+            df = df.rename(columns=col_map)
+            needed = [c for c in col_map.values() if c in df.columns]
+
+            result = {}
+            for _, row in df.iterrows():
+                code = str(row.get("code", ""))
+                if not code:
+                    continue
+                result[code] = RealtimeQuote(
+                    code=code,
+                    name=str(row.get("name", "")),
+                    price=_safe_float(row.get("price")),
+                    change_pct=_safe_float(row.get("change_pct")),
+                    change_amt=_safe_float(row.get("change_amt")),
+                    volume=_safe_int(row.get("volume")),
+                    turnover=_safe_float(row.get("turnover")),
+                    high=_safe_float(row.get("high")),
+                    low=_safe_float(row.get("low")),
+                    open=_safe_float(row.get("open")),
+                    pre_close=_safe_float(row.get("pre_close")),
+                    timestamp=datetime.now().strftime("%H:%M:%S"),
+                )
+
+            cache.set(cache_key, result, ttl=10.0)
+            return result
+
+        except Exception as e:
+            logger.warning(f"东方财富源行情失败 (第{attempt+1}/2次): {type(e).__name__}")
+            if attempt < 1:
+                time.sleep(3)
+
+    return None
+
+
+def _add_market_prefix(code: str) -> str:
+    """给纯数字代码加市场前缀 (新浪格式): '000001' → 'sz000001'"""
+    if code.startswith(("sz", "sh", "bj")):
+        return code
+    if code.startswith(("0", "3", "2")):
+        return f"sz{code}"
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    if code.startswith(("8", "4")):
+        return f"bj{code}"
+    return code
 
 
 def fetch_kline(
@@ -106,60 +199,62 @@ def fetch_kline(
     days: int = 250,
 ) -> list[KLineData]:
     """
-    获取历史K线数据 (带缓存)
+    获取历史K线数据 (带缓存，新浪源)
     period: 'daily' | 'weekly' | 'monthly'
+    周线/月线从日线聚合生成
     返回: list[KLineData] (按日期升序)
     """
+    import pandas as pd
+    import numpy as np
     cache = get_kline_cache()
     cache_key = f"kline:{code}:{period}:{days}"
 
     cached = cache.get(cache_key)
     if cached is not None:
-        logger.debug(f"K线缓存命中: {code} {period}")
         return cached
 
     try:
         import akshare as ak
-        logger.debug(f"从AKShare获取K线: {code} {period}")
 
         if period == "daily":
-            df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
-        elif period == "weekly":
-            df = ak.stock_zh_a_hist(symbol=code, period="weekly", adjust="qfq")
-        elif period == "monthly":
-            df = ak.stock_zh_a_hist(symbol=code, period="monthly", adjust="qfq")
+            logger.debug(f"从新浪源获取日K线: {code}")
+            sina_code = _add_market_prefix(code)
+            df = ak.stock_zh_a_daily(symbol=sina_code, adjust="qfq")
+            if df is None or df.empty:
+                return []
+            # 新浪列名已是英文: date, open, high, low, close, volume
+            df = df.tail(days)
+            result = _df_to_klines(df, code, "daily")
+
+        elif period in ("weekly", "monthly"):
+            # 从日线聚合
+            logger.debug(f"从日线聚合{period}K线: {code}")
+            sina_code = _add_market_prefix(code)
+            df = ak.stock_zh_a_daily(symbol=sina_code, adjust="qfq")
+            if df is None or df.empty:
+                return []
+
+            # 聚合
+            df["date"] = pd.to_datetime(df["date"])
+            df.set_index("date", inplace=True)
+            freq = "W" if period == "weekly" else "ME"
+            agg = df.resample(freq).agg({
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum",
+            }).dropna()
+            agg = agg.tail(days)
+            agg["date"] = agg.index.strftime("%Y-%m-%d")
+            result = _df_to_klines(agg.reset_index(drop=True), code, period)
+
         else:
             logger.warning(f"不支持的K线周期: {period}")
             return []
 
-        if df is None or df.empty:
-            logger.warning(f"{code} {period} K线数据为空")
-            return []
-
-        col_map = {
-            "日期": "date", "开盘": "open", "收盘": "close",
-            "最高": "high", "最低": "low", "成交量": "volume",
-        }
-        df = df.rename(columns=col_map)
-
-        if len(df) > days:
-            df = df.tail(days)
-
-        result = []
-        for _, row in df.iterrows():
-            result.append(KLineData(
-                code=code,
-                date=str(row["date"])[:10],
-                open=_safe_float(row.get("open")),
-                high=_safe_float(row.get("high")),
-                low=_safe_float(row.get("low")),
-                close=_safe_float(row.get("close")),
-                volume=_safe_int(row.get("volume")),
-                period=period,
-            ))
-
-        cache.set(cache_key, result, ttl=300.0)  # K线缓存5分钟
-        logger.info(f"获取 {code} {period} K线 {len(result)} 条，缓存5分钟")
+        cache.set(cache_key, result, ttl=300.0)
+        logger.info(f"获取 {code} {period} K线 {len(result)} 条")
         return result
 
     except Exception as e:
@@ -167,61 +262,66 @@ def fetch_kline(
         return []
 
 
+def _df_to_klines(df, code: str, period: str) -> list[KLineData]:
+    """DataFrame 转 KLineData 列表"""
+    result = []
+    for _, row in df.iterrows():
+        result.append(KLineData(
+            code=code,
+            date=str(row.get("date", ""))[:10],
+            open=_safe_float(row.get("open")),
+            high=_safe_float(row.get("high")),
+            low=_safe_float(row.get("low")),
+            close=_safe_float(row.get("close")),
+            volume=_safe_int(row.get("volume")),
+            period=period,
+        ))
+    return result
+
+
 def fetch_30min_kline(code: str, days: int = 60) -> list[KLineData]:
     """
     获取短周期K线数据 (用于30分钟级别分析)
-    注意: AKShare分钟接口 period='60' 获取60分钟线，
-    用60分钟线近似30分钟级别分析（每日8根60min线 ≈ 16根30min线）
+    优先使用东方财富源60分钟线，失败时返回空
     返回: list[KLineData]
     """
+    import time
     cache = get_30min_cache()
     cache_key = f"kline_60min:{code}:{days}"
 
     cached = cache.get(cache_key)
     if cached is not None:
-        logger.debug(f"60min K线缓存命中: {code}")
         return cached
 
-    try:
-        import akshare as ak
-        logger.debug(f"从AKShare获取60分钟K线: {code} (近似30分钟级别)")
+    for attempt in range(2):
+        try:
+            import akshare as ak
+            logger.debug(f"获取60分钟K线: {code} (第{attempt+1}次)")
 
-        df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
+            df = ak.stock_zh_a_hist_min_em(symbol=code, period="60", adjust="qfq")
+            if df is None or df.empty:
+                return []
 
-        if df is None or df.empty:
-            logger.warning(f"{code} 分钟K线数据为空")
-            return []
+            col_map = {
+                "时间": "date", "开盘": "open", "收盘": "close",
+                "最高": "high", "最低": "low", "成交量": "volume",
+            }
+            df = df.rename(columns=col_map)
+            limit = days * 8
+            if len(df) > limit:
+                df = df.tail(limit)
 
-        col_map = {
-            "时间": "date", "开盘": "open", "收盘": "close",
-            "最高": "high", "最低": "low", "成交量": "volume",
-        }
-        df = df.rename(columns=col_map)
+            result = _df_to_klines(df, code, "60min")
+            cache.set(cache_key, result, ttl=120.0)
+            logger.info(f"获取 {code} 60min K线 {len(result)} 条")
+            return result
 
-        limit = days * 8  # 每天约8根60分钟K线
-        if len(df) > limit:
-            df = df.tail(limit)
+        except Exception as e:
+            logger.warning(f"获取分钟K线失败 ({code}, 第{attempt+1}次): {e}")
+            if attempt < 1:
+                time.sleep(2)
 
-        result = []
-        for _, row in df.iterrows():
-            result.append(KLineData(
-                code=code,
-                date=str(row["date"]),
-                open=_safe_float(row.get("open")),
-                high=_safe_float(row.get("high")),
-                low=_safe_float(row.get("low")),
-                close=_safe_float(row.get("close")),
-                volume=_safe_int(row.get("volume")),
-                period="60min",
-            ))
-
-        cache.set(cache_key, result, ttl=120.0)  # 短周期缓存2分钟
-        logger.info(f"获取 {code} 60min K线 {len(result)} 条")
-        return result
-
-    except Exception as e:
-        logger.error(f"获取分钟K线失败 ({code}): {e}")
-        return []
+    return []
 
 
 def fetch_intraday_data(code: str) -> list[dict]:
@@ -270,38 +370,102 @@ def fetch_intraday_data(code: str) -> list[dict]:
         return []
 
 
-def search_stock(keyword: str) -> list[dict]:
-    """搜索股票代码或名称 (带缓存)"""
+def sync_stock_names_from_api() -> int:
+    """从 AKShare 同步全市场名称映射到本地数据库 (首次启动或手动刷新时调用)"""
+    import time
     cache = get_search_cache()
 
-    cached = cache.get("all_stocks")
-    if cached is None:
+    for attempt in range(3):
         try:
             import akshare as ak
-            logger.debug("从AKShare加载全市场股票列表...")
-            df = ak.stock_zh_a_spot_em()
-            results = []
-            for _, row in df.iterrows():
-                results.append({
-                    "code": str(row["代码"]),
-                    "name": str(row["名称"]),
-                    "price": _safe_float(row.get("最新价")),
-                })
-            cache.set("all_stocks", results, ttl=600.0)  # 全市场列表缓存10分钟
-            logger.info(f"全市场股票列表已缓存: {len(results)} 只")
+            logger.info(f"从AKShare同步全市场股票名称到本地库... (第{attempt+1}次)")
+            df = ak.stock_info_a_code_name()
+            records = [
+                {"code": str(row["code"]), "name": str(row["name"])}
+                for _, row in df.iterrows()
+            ]
+            count = save_stock_names_batch(records)
+            cache.set("names_synced", True, ttl=86400)  # 标记已同步24h
+            logger.info(f"股票名称同步完成: {count} 条")
+            return count
         except Exception as e:
-            logger.error(f"搜索股票失败: {e}")
-            return []
-    else:
-        results = cached
+            logger.warning(f"名称同步失败 (第{attempt+1}/3次): {e}")
+            if attempt < 2:
+                time.sleep((attempt + 1) * 2)
+    return 0
 
-    # 按代码或名称模糊搜索
+
+def search_stock(keyword: str) -> list[dict]:
+    """搜索股票代码或名称 (本地DB优先，首次启动自动同步)
+
+    - 首次使用：后台静默同步全市场名称到本地库
+    - 后续搜索：直接从本地 SQLite 查，毫秒级响应
+    - 本地库为空时：回退到 API 实时查询
+    """
+    import time
+    cache = get_search_cache()
+
+    # 首次启动或超过24h → 触发一次后台同步
+    if cache.get("names_synced") is None:
+        count = get_stock_names_count()
+        if count < 100:  # 本地库太少，说明还没同步过
+            logger.info("本地名称库为空，触发首次同步...")
+            try:
+                sync_stock_names_from_api()
+            except Exception as e:
+                logger.warning(f"首次同步失败，使用在线搜索: {e}")
+
+    # 优先查本地库
     keyword_lower = keyword.lower()
-    filtered = [
-        r for r in results
-        if keyword_lower in r["code"].lower() or keyword_lower in r["name"].lower()
-    ]
-    return filtered[:20]
+    local_results = search_stock_names(keyword, limit=20)
+    if local_results:
+        logger.info(
+            f"本地DB搜索 '{keyword}': {len(local_results)} 条 "
+            f"(共 {get_stock_names_count()} 条缓存)"
+        )
+        return [{"code": r["code"], "name": r["name"], "price": 0.0}
+                for r in local_results]
+
+    # 本地库无结果 → 回退到 API
+    logger.info(f"本地未找到 '{keyword}'，回退到API搜索")
+    return _search_stock_from_api(keyword)
+
+
+def _search_stock_from_api(keyword: str) -> list[dict]:
+    """API 实时搜索 (回退方案)"""
+    import time
+    cache = get_search_cache()
+
+    names_map = cache.get("all_stock_names")
+    if names_map is None:
+        last_error = None
+        for attempt in range(3):
+            try:
+                import akshare as ak
+                df = ak.stock_info_a_code_name()
+                names_map = {}
+                for _, row in df.iterrows():
+                    names_map[str(row["code"])] = str(row["name"])
+                cache.set("all_stock_names", names_map, ttl=3600.0)
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep((attempt + 1) * 2)
+        else:
+            raise RuntimeError(
+                f"无法连接行情服务器，请检查网络后重试。\n"
+                f"详情: {last_error}"
+            )
+
+    keyword_lower = keyword.lower()
+    filtered = []
+    for code, name in names_map.items():
+        if keyword_lower in code.lower() or keyword_lower in name.lower():
+            filtered.append({"code": code, "name": name, "price": 0.0})
+        if len(filtered) >= 20:
+            break
+    return filtered
 
 
 # ============================================================
@@ -321,9 +485,9 @@ class RealtimeWorker(QThread):
         try:
             result = fetch_realtime_quotes(self.codes)
             self.data_ready.emit(result)
-        except Exception as e:
-            logger.error(f"RealtimeWorker异常: {e}")
-            self.error_occurred.emit(str(e))
+        except Exception:
+            logger.error(f"RealtimeWorker异常:\n{traceback.format_exc()}")
+            self.error_occurred.emit(traceback.format_exc())
 
 
 class KLineWorker(QThread):
@@ -344,9 +508,9 @@ class KLineWorker(QThread):
             else:
                 result = fetch_kline(self.code, self.period, self.days)
             self.data_ready.emit(self.code, self.period, result)
-        except Exception as e:
-            logger.error(f"KLineWorker异常: {e}")
-            self.error_occurred.emit(str(e))
+        except Exception:
+            logger.error(f"KLineWorker异常:\n{traceback.format_exc()}")
+            self.error_occurred.emit(traceback.format_exc())
 
 
 class IntradayWorker(QThread):
@@ -362,9 +526,9 @@ class IntradayWorker(QThread):
         try:
             result = fetch_intraday_data(self.code)
             self.data_ready.emit(self.code, result)
-        except Exception as e:
-            logger.error(f"IntradayWorker异常: {e}")
-            self.error_occurred.emit(str(e))
+        except Exception:
+            logger.error(f"IntradayWorker异常:\n{traceback.format_exc()}")
+            self.error_occurred.emit(traceback.format_exc())
 
 
 class StockSearchWorker(QThread):
@@ -380,6 +544,126 @@ class StockSearchWorker(QThread):
         try:
             result = search_stock(self.keyword)
             self.data_ready.emit(result)
-        except Exception as e:
-            logger.error(f"StockSearchWorker异常: {e}")
-            self.error_occurred.emit(str(e))
+        except Exception:
+            logger.error(f"StockSearchWorker异常:\n{traceback.format_exc()}")
+            self.error_occurred.emit(traceback.format_exc())
+
+
+# ============================================================
+# 单股行情获取 (增量更新用)
+# ============================================================
+
+def fetch_single_stock_quote(code: str) -> Optional[RealtimeQuote]:
+    """获取单只股票的最新行情 (从日K线最后一条提取)
+    耗时 ~1.5s/只，适合增量更新场景
+    """
+    import akshare as ak
+    sina_code = _add_market_prefix(code)
+    try:
+        df = ak.stock_zh_a_daily(symbol=sina_code, adjust="qfq")
+        if df is None or df.empty:
+            return None
+        last = df.iloc[-1]
+        # 计算涨跌幅 (相对于前一日收盘)
+        pre_close = _safe_float(df.iloc[-2]["close"]) if len(df) >= 2 else _safe_float(last["close"])
+        price = _safe_float(last["close"])
+        change_pct = ((price - pre_close) / pre_close * 100) if pre_close > 0 else 0.0
+        return RealtimeQuote(
+            code=code,
+            name="",  # 名称由DB提供
+            price=price,
+            change_pct=round(change_pct, 2),
+            change_amt=round(price - pre_close, 2),
+            volume=_safe_int(last.get("volume")),
+            turnover=_safe_float(last.get("amount")) if "amount" in df.columns else 0.0,
+            high=_safe_float(last.get("high")),
+            low=_safe_float(last.get("low")),
+            open=_safe_float(last.get("open")),
+            pre_close=round(pre_close, 2),
+            timestamp=datetime.now().strftime("%H:%M:%S"),
+        )
+    except Exception as e:
+        logger.warning(f"获取单股行情失败 ({code}): {type(e).__name__}")
+        return None
+
+
+# ============================================================
+# 并行增量刷新 Worker (每30s, 所有已追踪股票)
+# ============================================================
+
+class IncrementalRefreshWorker(QThread):
+    """并行增量刷新 — 对所有追踪股票逐只获取最新行情，线程池并行，不阻塞
+    与 InitialFetchWorker (新股全量) 独立运行，互不干扰
+    """
+    data_ready = pyqtSignal(dict)       # {code: RealtimeQuote}
+    stock_done = pyqtSignal(str, object) # (code, RealtimeQuote or None)
+
+    def __init__(self, codes: list[str], parent=None):
+        super().__init__(parent)
+        self.codes = codes
+
+    def run(self):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results = {}
+
+        if not self.codes:
+            self.data_ready.emit(results)
+            return
+
+        # 并行获取 (max_workers=3 避免打爆API)
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {executor.submit(fetch_single_stock_quote, c): c for c in self.codes}
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    quote = future.result()
+                    if quote:
+                        results[code] = quote
+                    self.stock_done.emit(code, quote)
+                except Exception:
+                    logger.warning(f"增量刷新 {code} 失败:\n{traceback.format_exc()}")
+                    self.stock_done.emit(code, None)
+
+        self.data_ready.emit(results)
+
+
+# ============================================================
+# 新股全量数据 Worker (添加新股时独立运行)
+# ============================================================
+
+class InitialFetchWorker(QThread):
+    """新股全量数据获取 — 获取日线/周线/月线K线，独立于增量刷新
+    完成后通过信号通知UI更新
+    """
+    kline_ready = pyqtSignal(str, str, list)  # (code, period, list[KLineData])
+    all_done = pyqtSignal(str)                # code — 全部周期获取完成
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, code: str, parent=None):
+        super().__init__(parent)
+        self.code = code
+
+    def run(self):
+        try:
+            # 并行获取3个周期
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            periods = ["daily", "weekly", "monthly"]
+            days_map = {"daily": 250, "weekly": 100, "monthly": 60}
+
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = {
+                    executor.submit(fetch_kline, self.code, p, days_map[p]): p
+                    for p in periods
+                }
+                for future in as_completed(futures):
+                    period = futures[future]
+                    try:
+                        klines = future.result()
+                        self.kline_ready.emit(self.code, period, klines)
+                    except Exception as e:
+                        logger.warning(f"新股 {self.code} {period} K线获取失败: {e}")
+
+            self.all_done.emit(self.code)
+        except Exception:
+            logger.error(f"InitialFetchWorker异常 ({self.code}):\n{traceback.format_exc()}")
+            self.error_occurred.emit(traceback.format_exc())

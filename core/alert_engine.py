@@ -162,6 +162,7 @@ class AlertEngine:
         - 默认: 买入价 × 1.10 (涨停价)
         - 检测到30分钟级别缠论顶分型后: 切换为该顶分型的最高价，之后不再更新
         - 如果存在手动设置，返回冲突信息而不自动更新
+        - 限流: 30min分型检测每分钟最多查一次 (避免高频调用重复拉API)
 
         返回: (当前止盈价, 冲突信息或None)
         """
@@ -185,6 +186,15 @@ class AlertEngine:
         # 如果已检测到顶分型，止盈线已锁定不再更新
         if state.top_fractal_detected:
             return state.take_profit_price, None
+
+        # 限流: 30min分型检测每分钟最多查一次
+        import time as _time
+        now_ts = _time.time()
+        if not hasattr(state, '_last_fractal_check'):
+            state._last_fractal_check = 0.0
+        if now_ts - state._last_fractal_check < 60:
+            return state.take_profit_price, None
+        state._last_fractal_check = now_ts
 
         # 检查是否有30分钟级别顶分型
         klines_30min = fetch_30min_kline(code, days=10)

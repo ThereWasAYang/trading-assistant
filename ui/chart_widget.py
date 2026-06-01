@@ -357,11 +357,17 @@ class ChartWidget(QWidget):
         layout.addWidget(self.tabs)
 
     def load_stock(self, code: str):
-        """加载股票全部周期数据"""
+        """加载股票全部周期数据 (首次打开时)"""
         self.intraday_tab.load_data(code)
         self.daily_tab.load_data(code)
         self.weekly_tab.load_data(code)
         self.monthly_tab.load_data(code)
+
+    def refresh_current_tab(self, code: str):
+        """仅刷新当前显示的周期数据 (定时刷新用，减少API调用)"""
+        current = self.tabs.currentWidget()
+        if current and hasattr(current, 'load_data'):
+            current.load_data(code)
 
     def set_alert_lines(self, stop_loss: float, take_profit: float):
         """设置所有周期图表的止损止盈线"""

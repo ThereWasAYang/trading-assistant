@@ -125,17 +125,17 @@ class StockTableModel(QAbstractTableModel):
         if role != Qt.DisplayRole:
             return None
 
-        # 显示值
+        # 显示值 — 行情缺失时显示 "--"
         if col == self.COL_CODE:
             return code
         elif col == self.COL_NAME:
-            return quote.name
+            return quote.name or "--"
         elif col == self.COL_PRICE:
-            return f"{quote.price:.2f}"
+            return f"{quote.price:.2f}" if quote.price > 0 else "--"
         elif col == self.COL_CHANGE_PCT:
-            return f"{quote.change_pct:+.2f}%"
+            return f"{quote.change_pct:+.2f}%" if quote.price > 0 else "--"
         elif col == self.COL_CHANGE_AMT:
-            return f"{quote.change_amt:+.2f}"
+            return f"{quote.change_amt:+.2f}" if quote.price > 0 else "--"
         elif col == self.COL_VOLUME:
             return f"{quote.volume:,}"
         elif col == self.COL_STOP_LOSS:

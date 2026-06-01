@@ -5,7 +5,7 @@ from datetime import datetime
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
-    QTreeWidget, QTreeWidgetItem, QTableView, QTabWidget,
+    QListWidget, QListWidgetItem, QTableView, QTabWidget,
     QStatusBar, QLabel, QMenuBar, QAction, QMessageBox,
     QSystemTrayIcon, QMenu, QApplication, QHeaderView,
     QAbstractItemView,
@@ -25,7 +25,8 @@ from data.database import (
     is_alert_disabled, disable_alert, enable_alert,
 )
 from data.market_data import (
-    RealtimeWorker, KLineWorker, IntradayWorker, StockSearchWorker,
+    KLineWorker, IntradayWorker, StockSearchWorker,
+    IncrementalRefreshWorker, InitialFetchWorker,
 )
 from data.models import RealtimeQuote, Group, Stock
 from core.alert_engine import AlertEngine
@@ -128,12 +129,10 @@ class MainWindow(QMainWindow):
         left_label.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
         left_layout.addWidget(left_label)
 
-        self.group_tree = QTreeWidget()
-        self.group_tree.setHeaderHidden(True)
-        self.group_tree.setFixedWidth(SIDEBAR_WIDTH)
-        self.group_tree.setRootIsDecorated(True)
-        self.group_tree.currentItemChanged.connect(self._on_group_selected)
-        left_layout.addWidget(self.group_tree)
+        self.group_list = QListWidget()
+        self.group_list.setFixedWidth(SIDEBAR_WIDTH)
+        self.group_list.currentItemChanged.connect(self._on_group_selected)
+        left_layout.addWidget(self.group_list)
 
         # ---- 右侧面板 ----
         right_splitter = QSplitter(Qt.Vertical)
@@ -278,47 +277,34 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def _load_groups(self):
-        """加载分组到左侧树"""
-        self.group_tree.blockSignals(True)
-        self.group_tree.clear()
+        """加载分组到左侧列表 (扁平单层)"""
+        self.group_list.blockSignals(True)
+        self.group_list.clear()
 
         groups = get_all_groups()
         type_order = {"holding": 0, "cleared": 1, "tracking": 2, "custom": 3}
-        type_labels = {"holding": "📁 持仓中", "cleared": "📁 已清仓",
-                       "tracking": "📁 跟踪中", "custom": "📁 "}
+        type_icons = {"holding": "📊", "cleared": "📋", "tracking": "👁", "custom": "📁"}
 
         groups.sort(key=lambda g: (type_order.get(g.type, 99), g.sort_order))
 
-        current_type = None
-        type_parent = None
         for g in groups:
-            if g.type != current_type:
-                type_parent = QTreeWidgetItem(self.group_tree)
-                if g.type == "custom":
-                    type_parent.setText(0, "📁 自定义")
-                else:
-                    type_parent.setText(0, type_labels.get(g.type, g.name))
-                type_parent.setData(0, Qt.UserRole, -1)
-                type_parent.setExpanded(True)
-                current_type = g.type
+            icon = type_icons.get(g.type, "📁")
+            item = QListWidgetItem(f"{icon}  {g.name}")
+            item.setData(Qt.UserRole, g.id)
+            item.setData(Qt.UserRole + 1, g.type)
+            self.group_list.addItem(item)
 
-            item = QTreeWidgetItem(type_parent)
-            item.setText(0, g.name)
-            item.setData(0, Qt.UserRole, g.id)
-            item.setData(0, Qt.UserRole + 1, g.type)
+        self.group_list.blockSignals(False)
 
-        self.group_tree.blockSignals(False)
-
-        if self.group_tree.topLevelItemCount() > 0:
-            first_parent = self.group_tree.topLevelItem(0)
-            if first_parent.childCount() > 0:
-                self.group_tree.setCurrentItem(first_parent.child(0))
+        # 默认选中第一个
+        if self.group_list.count() > 0:
+            self.group_list.setCurrentRow(0)
 
     def _on_group_selected(self, current, previous):
         if current is None:
             return
-        group_id = current.data(0, Qt.UserRole)
-        if group_id is None or group_id < 0:
+        group_id = current.data(Qt.UserRole)
+        if group_id is None:
             return
         self._current_group_id = group_id
         self._refresh_current_group_data()
@@ -328,22 +314,26 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def _refresh_current_group_data(self):
-        """刷新当前选中分组的股票数据"""
+        """增量刷新 — 仅对已追踪股票逐只获取最新行情 (30s间隔，并行3线程)"""
         codes = self._get_all_tracked_codes()
         if not codes:
             return
 
-        self._realtime_worker = RealtimeWorker(codes)
-        self._realtime_worker.data_ready.connect(self._on_quote_data_ready)
-        self._realtime_worker.error_occurred.connect(
-            lambda e: logger.error(f"行情数据错误: {e}"))
-        self._realtime_worker.start()
+        # 跳过还在等待初始全量数据的新股 (它们由 InitialFetchWorker 处理)
+        pending = getattr(self, '_pending_initial_fetch', set())
+        refresh_codes = [c for c in codes if c not in pending]
+        if not refresh_codes:
+            return
+
+        self._inc_worker = IncrementalRefreshWorker(refresh_codes)
+        self._inc_worker.stock_done.connect(self._on_stock_incremental_done)
+        self._inc_worker.data_ready.connect(self._on_incremental_complete)
+        self._inc_worker.start()
 
     def _refresh_kline_if_active(self):
-        """如果当前有正在查看的股票，自动刷新K线"""
+        """如果当前有正在查看的股票，仅刷新当前显示的周期"""
         if self._current_stock_code:
-            logger.debug(f"自动刷新K线: {self._current_stock_code}")
-            self.chart_widget.load_stock(self._current_stock_code)
+            self.chart_widget.refresh_current_tab(self._current_stock_code)
 
     def _get_all_tracked_codes(self) -> list[str]:
         """获取所有需要监控的股票代码"""
@@ -357,25 +347,48 @@ class MainWindow(QMainWindow):
         stocks = get_stocks_by_group(self._current_group_id)
         return [s.code for s in stocks]
 
-    def _on_quote_data_ready(self, quotes: dict[str, RealtimeQuote]):
-        """实时行情数据到达"""
-        self._quotes_cache = quotes
+    def _on_stock_incremental_done(self, code: str, quote):
+        """单只股票增量数据到达 — 逐步更新缓存和表格"""
+        if quote:
+            self._quotes_cache[code] = quote
+            # 实时更新表格中该行
+            self._refresh_table_display()
 
-        # 更新当前分组表格
-        codes = self._get_current_group_codes()
-        current_quotes = {c: quotes[c] for c in codes if c in quotes}
-        self.stock_table.update_quotes(current_quotes, self._alert_triggered_codes,
-                                       self._bp_triggered_codes)
+    def _on_incremental_complete(self, quotes: dict[str, RealtimeQuote]):
+        """本轮增量刷新全部完成"""
+        # 合并到缓存
+        self._quotes_cache.update(quotes)
+        self._refresh_table_display()
 
-        # 更新状态栏
         now = datetime.now().strftime("%H:%M:%S")
         self._status_refresh_label.setText(f"上次刷新: {now}")
 
-        # 检查止损止盈 (使用AlertEngine)
-        self._check_alerts(quotes)
+        if quotes:
+            self._check_alerts(self._quotes_cache)
+            self._update_profit_status(self._quotes_cache)
 
-        # 更新状态栏盈亏
-        self._update_profit_status(quotes)
+    def _refresh_table_display(self):
+        """根据DB+缓存刷新表格 (行情缺失时stub填充)"""
+        codes = self._get_current_group_codes()
+        stocks_in_group = get_stocks_by_group(self._current_group_id)
+        name_map = {s.code: s.name for s in stocks_in_group}
+
+        merged = {}
+        for code in codes:
+            if code in self._quotes_cache and self._quotes_cache[code].price > 0:
+                q = self._quotes_cache[code]
+                # 增量行情不带名称，从 DB 补全
+                if not q.name:
+                    q.name = name_map.get(code, "")
+                merged[code] = q
+            else:
+                merged[code] = RealtimeQuote(
+                    code=code, name=name_map.get(code, ""),
+                    price=0.0, timestamp="--",
+                )
+
+        self.stock_table.update_quotes(merged, self._alert_triggered_codes,
+                                       self._bp_triggered_codes)
 
     def _update_profit_status(self, quotes: dict[str, RealtimeQuote]):
         """更新持仓盈亏状态栏"""
@@ -551,16 +564,34 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def _scan_buy_points(self):
-        """异步扫描所有跟踪股票的买点 (使用BuyPointScanWorker)"""
+        """异步扫描所有跟踪股票的买点 (使用BuyPointScanWorker)
+        防止并发过载: 上一轮未完成时跳过，同时最多3个worker并行
+        """
         codes = self._get_all_tracked_codes()
         if not codes:
             return
 
-        logger.debug(f"开始异步买点扫描: {len(codes)} 只股票")
-        for code in codes:
+        # 防止重复触发
+        if getattr(self, '_bp_scanning', False):
+            logger.debug("上一轮买点扫描尚未完成，跳过")
+            return
+        self._bp_scanning = True
+        self._bp_scan_pending = 0
+
+        logger.info(f"开始异步买点扫描: {len(codes)} 只股票")
+        for i, code in enumerate(codes):
             worker = BuyPointScanWorker(code)
             worker.scan_done.connect(self._on_buy_point_result)
+            worker.scan_done.connect(lambda c, r, w=worker: self._on_scan_worker_done(w))
             worker.start()
+            self._bp_scan_pending += 1
+
+    def _on_scan_worker_done(self, worker):
+        """单个买点扫描worker完成"""
+        self._bp_scan_pending -= 1
+        if self._bp_scan_pending <= 0:
+            self._bp_scan_pending = 0
+            self._bp_scanning = False
 
     def _on_buy_point_result(self, code: str, result: dict):
         """买点扫描结果回调（主线程）"""
@@ -687,17 +718,112 @@ class MainWindow(QMainWindow):
         self.stock_table.clear_highlights()
 
     def _on_add_stock(self):
-        """添加股票"""
+        """添加股票 — 纯代码走本地确认，关键字走搜索"""
         from PyQt5.QtWidgets import QInputDialog
+        import re
+
+        # 如果没有选中分组，默认选"跟踪中"
+        if self._current_group_id < 0:
+            for g in get_all_groups():
+                if g.type == "tracking":
+                    self._current_group_id = g.id
+                    break
 
         keyword, ok = QInputDialog.getText(self, "添加股票", "输入股票代码或名称:")
         if not ok or not keyword.strip():
             return
 
         keyword = keyword.strip()
+
+        # 检测是否为纯6位数字代码
+        if re.match(r"^\d{6}$", keyword):
+            self._try_add_by_code(keyword)
+        else:
+            # 关键字搜索 — 异步
+            self.status_bar.showMessage(f"正在搜索 '{keyword}' ...")
+            self._search_worker = StockSearchWorker(keyword)
+            self._search_worker.data_ready.connect(
+                lambda results: self._on_search_result(results, keyword))
+            self._search_worker.error_occurred.connect(self._on_search_error)
+            self._search_worker.start()
+
+    def _try_add_by_code(self, code: str):
+        """纯代码添加: DB有→弹窗确认→添加; DB没有→全量同步→再查"""
+        from data.database import get_stock_name
+        from data.market_data import sync_stock_names_from_api
+
+        name = get_stock_name(code)
+        if name:
+            reply = QMessageBox.question(
+                self, "确认添加",
+                f"检测到股票:\n\n{code}  {name}\n\n确认添加到当前分组?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                self._do_add_stock(code, name)
+            else:
+                logger.info(f"用户取消添加 {code}")
+            return
+
+        # DB中没有 → 触发全量同步
+        logger.info(f"本地无 {code}，触发全量名称同步...")
+        self.status_bar.showMessage("正在同步股票名称库...")
+        sync_stock_names_from_api()
+        name = get_stock_name(code)
+        if name:
+            self._do_add_stock(code, name)
+        else:
+            QMessageBox.warning(self, "未找到", f"未找到代码 {code}，请检查后重试。")
+
+    def _do_add_stock(self, code: str, name: str):
+        """添加股票到DB，启动独立全量数据获取 (不阻塞增量刷新)"""
+        stock = add_stock(code, name, self._current_group_id)
+        if stock is None:
+            QMessageBox.information(self, "提示", f"股票 {code} 已存在于此分组")
+            return
+
+        self.status_bar.showMessage(f"已添加: {code} {name}，正在获取全量数据...")
+        logger.info(f"添加股票: {code} {name}")
+
+        # 标记为等待初始全量数据 (增量刷新暂时跳过)
+        if not hasattr(self, '_pending_initial_fetch'):
+            self._pending_initial_fetch = set()
+        self._pending_initial_fetch.add(code)
+
+        # 先刷新表格显示 (stub数据)
+        self._refresh_table_display()
+
+        # 启动独立的全量数据 Worker (与增量刷新互不阻塞)
+        self._init_worker = InitialFetchWorker(code)
+        self._init_worker.kline_ready.connect(self._on_new_stock_kline_ready)
+        self._init_worker.all_done.connect(self._on_new_stock_init_done)
+        self._init_worker.error_occurred.connect(
+            lambda e: logger.error(f"新股 {code} 全量数据获取失败: {e}"))
+        self._init_worker.start()
+
+    def _on_new_stock_kline_ready(self, code: str, period: str, klines: list):
+        """新股某周期K线到达 → 更新图表 (如果正在查看)"""
+        if code == self._current_stock_code:
+            for i in range(self.chart_widget.tabs.count()):
+                tab = self.chart_widget.tabs.widget(i)
+                if hasattr(tab, 'period') and tab.period == period:
+                    tab.klines = klines
+                    tab._draw_kline()
+                    break
+
+    def _on_new_stock_init_done(self, code: str):
+        """新股全量数据获取完成 → 从等待列表移除，加入增量刷新"""
+        self._pending_initial_fetch.discard(code)
+        self.status_bar.showMessage(f"{code} 全量数据获取完成", 3000)
+        logger.info(f"{code} 全量数据初始化完成")
+
+    def _fallback_to_search(self, keyword: str):
+        """回退到搜索模式"""
         self._search_worker = StockSearchWorker(keyword)
         self._search_worker.data_ready.connect(
             lambda results: self._on_search_result(results, keyword))
+        self._search_worker.error_occurred.connect(self._on_search_error)
         self._search_worker.start()
 
     def _on_search_result(self, results: list[dict], keyword: str):
@@ -745,6 +871,15 @@ class MainWindow(QMainWindow):
             logger.info(f"添加股票: {r['code']} {r['name']}")
         else:
             QMessageBox.information(self, "提示", f"股票 {r['code']} 已存在于此分组")
+
+    def _on_search_error(self, error_msg: str):
+        """搜索出错回调"""
+        self.status_bar.showMessage("搜索失败", 5000)
+        logger.error(f"搜索失败: {error_msg}")
+        QMessageBox.warning(
+            self, "搜索失败",
+            f"无法搜索股票，请检查网络连接。\n\n{error_msg}"
+        )
 
     def _on_new_group(self):
         """新建自定义分组"""

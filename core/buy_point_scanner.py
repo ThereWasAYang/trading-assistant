@@ -21,6 +21,8 @@ from config import (
     VOLUME_CONTRACTION_RATIO,
     CENTER_LOOKBACK_WEEKS,
 )
+import traceback
+
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -178,8 +180,8 @@ class BuyPointScanWorker(QThread):
         try:
             scanner = BuyPointScanner()
             scanner.scan(self.code, callback=self._on_result)
-        except Exception as e:
-            logger.error(f"BuyPointScanWorker异常 ({self.code}): {e}")
+        except Exception:
+            logger.error(f"BuyPointScanWorker异常 ({self.code}):\n{traceback.format_exc()}")
             self.scan_done.emit(self.code, {
                 "code": self.code,
                 "triggered": False,
