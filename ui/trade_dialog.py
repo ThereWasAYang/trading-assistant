@@ -129,8 +129,8 @@ class TradeDialog(QDialog):
         if s["hold_qty"] > 0:
             # 尝试获取实时价格
             main_win = self._get_main_window()
-            if main_win and self.stock_code in main_win._quotes_cache:
-                current_price = main_win._quotes_cache[self.stock_code].price
+            if main_win and main_win.data_manager.get_quote(self.stock_code):
+                current_price = main_win.data_manager.get_quote(self.stock_code).price
                 unrealized = (current_price - s["avg_cost"]) * s["hold_qty"]
                 profit += unrealized
                 pct = (current_price / s["avg_cost"] - 1) * 100 if s["avg_cost"] > 0 else 0

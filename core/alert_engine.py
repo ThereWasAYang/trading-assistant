@@ -6,7 +6,8 @@ from typing import Optional, Tuple
 import numpy as np
 
 from data.models import AlertState, RealtimeQuote, KLineData
-from data.market_data import fetch_kline, fetch_30min_kline
+from data.market_data import fetch_30min_kline
+from data.market_data_manager import get_data_manager
 from data.database import (
     get_position_summary, get_first_buy_date, is_alert_disabled,
     get_manual_alert, set_manual_alert, clear_manual_alert,
@@ -109,7 +110,8 @@ class AlertEngine:
         if state.stop_loss_price <= 0:
             first_buy_date = get_first_buy_date(code)
             if first_buy_date:
-                klines = fetch_kline(code, "daily", days=120)
+                manager = get_data_manager()
+                klines = manager.get_klines(code, "daily", days=120)
                 if klines:
                     arr = kline_to_arrays(klines)
                     buy_idx = -1
@@ -292,7 +294,8 @@ class AlertEngine:
         if state.sl_manual:
             return state.stop_loss_price, None
 
-        klines = fetch_kline(code, "daily", days=120)
+        manager = get_data_manager()
+        klines = manager.get_klines(code, "daily", days=120)
         if not klines:
             return 0.0, None
 

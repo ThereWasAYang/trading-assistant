@@ -9,7 +9,8 @@ import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from data.models import BuyPointState
-from data.market_data import fetch_kline, fetch_30min_kline
+from data.market_data import fetch_30min_kline
+from data.market_data_manager import get_data_manager
 from core.technical import (
     kline_to_arrays,
     get_latest_bottom_fractal,
@@ -98,8 +99,9 @@ class BuyPointScanner:
         return state
 
     def _check_weekly_bottom_fractal(self, code: str) -> bool:
-        """检查周线底分型"""
-        weekly_klines = fetch_kline(code, "weekly", days=365)
+        """检查周线底分型 (数据源: Manager)"""
+        manager = get_data_manager()
+        weekly_klines = manager.get_klines(code, "weekly", days=365)
         if not weekly_klines:
             return False
 
@@ -116,8 +118,9 @@ class BuyPointScanner:
         return False
 
     def _check_daily_macd_golden_cross(self, code: str) -> bool:
-        """检查日线MACD金叉 (DIF上穿DEA)"""
-        daily_klines = fetch_kline(code, "daily", days=120)
+        """检查日线MACD金叉 (数据源: Manager)"""
+        manager = get_data_manager()
+        daily_klines = manager.get_klines(code, "daily", days=120)
         if not daily_klines:
             return False
 

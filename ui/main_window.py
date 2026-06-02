@@ -16,7 +16,8 @@ from PyQt5.QtGui import QIcon, QColor, QFont
 from config import (
     WINDOW_TITLE, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT,
     SIDEBAR_WIDTH, REALTIME_REFRESH_MS, BUYPOINT_SCAN_INTERVAL_MS,
-    KLINE_REFRESH_MS, DAILY_STOP_LOSS_HOUR, DAILY_STOP_LOSS_MINUTE,
+    KLINE_REFRESH_MS, KLINE_FLUSH_INTERVAL_SEC,
+    DAILY_STOP_LOSS_HOUR, DAILY_STOP_LOSS_MINUTE,
     STOCK_TABLE_COLUMNS, PRESET_GROUPS, CHART_COLORS,
 )
 from data.database import (
@@ -28,9 +29,11 @@ from data.market_data import (
     KLineWorker, IntradayWorker, StockSearchWorker,
     IncrementalRefreshWorker, InitialFetchWorker,
 )
+from data.market_data_manager import get_data_manager
 from data.models import RealtimeQuote, Group, Stock
 from core.alert_engine import AlertEngine
 from core.buy_point_scanner import BuyPointScanWorker
+from utils import is_trading_time
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -53,10 +56,12 @@ class MainWindow(QMainWindow):
         # ---- 引擎 ----
         self.alert_engine = AlertEngine()
 
+        # ---- 数据管理器 (内存+DB双层) ----
+        self.data_manager = get_data_manager()
+
         # ---- 内部状态 ----
         self._current_group_id: int = -1
         self._current_stock_code: str = ""
-        self._quotes_cache: dict[str, RealtimeQuote] = {}
         self._buy_point_states: dict[str, dict] = {}
         self._tray_flash_timer: QTimer = None
         self._tray_flash_on: bool = False
@@ -307,20 +312,25 @@ class MainWindow(QMainWindow):
         if group_id is None:
             return
         self._current_group_id = group_id
-        self._refresh_current_group_data()
+        self._refresh_current_group_data()  # 始终刷新表格，交易时段额外拉API
 
     # ================================================================
     # 数据刷新
     # ================================================================
 
     def _refresh_current_group_data(self):
-        """增量刷新 — 仅对已追踪股票逐只获取最新行情 (30s间隔，并行3线程)"""
+        """刷新当前分组：始终刷新表格显示，交易时段才拉API增量数据"""
+        self._refresh_table_display()  # 切换分组/添加删除/F5 等始终生效
+
+        if not is_trading_time():
+            return
+
         codes = self._get_all_tracked_codes()
         if not codes:
             return
 
-        # 跳过还在等待初始全量数据的新股 (它们由 InitialFetchWorker 处理)
-        pending = getattr(self, '_pending_initial_fetch', set())
+        # 跳过还在等待初始全量数据的新股
+        pending = self.data_manager.get_pending_codes()
         refresh_codes = [c for c in codes if c not in pending]
         if not refresh_codes:
             return
@@ -331,7 +341,9 @@ class MainWindow(QMainWindow):
         self._inc_worker.start()
 
     def _refresh_kline_if_active(self):
-        """如果当前有正在查看的股票，仅刷新当前显示的周期"""
+        """如果当前有正在查看的股票，刷新K线图表 — 仅交易时段"""
+        if not is_trading_time():
+            return
         if self._current_stock_code:
             self.chart_widget.refresh_current_tab(self._current_stock_code)
 
@@ -348,35 +360,40 @@ class MainWindow(QMainWindow):
         return [s.code for s in stocks]
 
     def _on_stock_incremental_done(self, code: str, quote):
-        """单只股票增量数据到达 — 逐步更新缓存和表格"""
+        """单只股票增量数据到达 — 实时更新表格"""
         if quote:
-            self._quotes_cache[code] = quote
-            # 实时更新表格中该行
             self._refresh_table_display()
 
     def _on_incremental_complete(self, quotes: dict[str, RealtimeQuote]):
         """本轮增量刷新全部完成"""
-        # 合并到缓存
-        self._quotes_cache.update(quotes)
+        # Manager 已自行更新内部缓存，此处只刷新UI
         self._refresh_table_display()
 
         now = datetime.now().strftime("%H:%M:%S")
         self._status_refresh_label.setText(f"上次刷新: {now}")
 
+        # 定期 flush 今日bar到DB
+        if self.data_manager.should_flush(KLINE_FLUSH_INTERVAL_SEC):
+            flushed = self.data_manager.flush_today_bars()
+            if flushed > 0:
+                logger.debug(f"定时flush: {flushed} 条今日bar写入DB")
+
         if quotes:
-            self._check_alerts(self._quotes_cache)
-            self._update_profit_status(self._quotes_cache)
+            all_quotes = self.data_manager.get_all_quotes()
+            self._check_alerts(all_quotes)
+            self._update_profit_status(all_quotes)
 
     def _refresh_table_display(self):
-        """根据DB+缓存刷新表格 (行情缺失时stub填充)"""
+        """根据DB+Manager缓存刷新表格 (行情缺失时stub填充)"""
         codes = self._get_current_group_codes()
         stocks_in_group = get_stocks_by_group(self._current_group_id)
         name_map = {s.code: s.name for s in stocks_in_group}
+        quotes_cache = self.data_manager.get_all_quotes()
 
         merged = {}
         for code in codes:
-            if code in self._quotes_cache and self._quotes_cache[code].price > 0:
-                q = self._quotes_cache[code]
+            if code in quotes_cache and quotes_cache[code].price > 0:
+                q = quotes_cache[code]
                 # 增量行情不带名称，从 DB 补全
                 if not q.name:
                     q.name = name_map.get(code, "")
@@ -564,9 +581,9 @@ class MainWindow(QMainWindow):
     # ================================================================
 
     def _scan_buy_points(self):
-        """异步扫描所有跟踪股票的买点 (使用BuyPointScanWorker)
-        防止并发过载: 上一轮未完成时跳过，同时最多3个worker并行
-        """
+        """异步扫描所有跟踪股票的买点 — 仅交易时段运行"""
+        if not is_trading_time():
+            return
         codes = self._get_all_tracked_codes()
         if not codes:
             return
@@ -696,7 +713,7 @@ class MainWindow(QMainWindow):
     def _on_manual_alert_settings(self, code: str):
         """打开手动止盈止损设置对话框"""
         from ui.alert_settings_dialog import AlertSettingsDialog
-        quote = self._quotes_cache.get(code)
+        quote = self.data_manager.get_quote(code)
         dlg = AlertSettingsDialog(code, quote, self)
         if dlg.exec_() == AlertSettingsDialog.Accepted:
             result = dlg.get_result()
@@ -787,9 +804,7 @@ class MainWindow(QMainWindow):
         logger.info(f"添加股票: {code} {name}")
 
         # 标记为等待初始全量数据 (增量刷新暂时跳过)
-        if not hasattr(self, '_pending_initial_fetch'):
-            self._pending_initial_fetch = set()
-        self._pending_initial_fetch.add(code)
+        self.data_manager.mark_pending(code)
 
         # 先刷新表格显示 (stub数据)
         self._refresh_table_display()
@@ -813,9 +828,10 @@ class MainWindow(QMainWindow):
                     break
 
     def _on_new_stock_init_done(self, code: str):
-        """新股全量数据获取完成 → 从等待列表移除，加入增量刷新"""
-        self._pending_initial_fetch.discard(code)
-        self.status_bar.showMessage(f"{code} 全量数据获取完成", 3000)
+        """新股全量数据获取完成 → 刷新表格显示（现价已由Manager写入）"""
+        self.data_manager.unmark_pending(code)
+        self._refresh_table_display()  # 立即显示新股的现价数据
+        self.status_bar.showMessage(f"{code} 数据初始化完成", 3000)
         logger.info(f"{code} 全量数据初始化完成")
 
     def _fallback_to_search(self, keyword: str):

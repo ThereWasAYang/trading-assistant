@@ -84,6 +84,21 @@ def init_db():
             name TEXT NOT NULL,
             updated_at TEXT DEFAULT (datetime('now','localtime'))
         );
+
+        CREATE TABLE IF NOT EXISTS klines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL,
+            date TEXT NOT NULL,
+            open REAL NOT NULL,
+            high REAL NOT NULL,
+            low REAL NOT NULL,
+            close REAL NOT NULL,
+            volume INTEGER DEFAULT 0,
+            period TEXT NOT NULL DEFAULT 'daily',
+            UNIQUE(code, date, period)
+        );
+        CREATE INDEX IF NOT EXISTS idx_klines_code_date
+            ON klines(code, period, date);
     """)
 
     # 预设分组 — 先建唯一索引防止重复
@@ -529,3 +544,105 @@ def update_stock_name(code: str, name: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+# ============================================================
+# K线数据 (klines) — 持久化历史K线，减少API调用
+# ============================================================
+
+def save_klines_batch(klines: list) -> int:
+    """批量 upsert K线数据 [{code, date, open, high, low, close, volume, period}, ...]
+    返回实际写入行数
+    UNIQUE(code, date, period) 保证同一天同一周期只有一条记录
+    """
+    if not klines:
+        return 0
+    conn = _connect()
+    count = 0
+    for k in klines:
+        cur = conn.execute(
+            "INSERT OR REPLACE INTO klines (code, date, open, high, low, close, volume, period) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (k["code"], k["date"], k["open"], k["high"], k["low"],
+             k["close"], k.get("volume", 0), k.get("period", "daily")),
+        )
+        count += cur.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
+def get_klines(
+    code: str,
+    period: str = "daily",
+    days: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict]:
+    """从DB获取K线数据，按日期升序返回
+    返回: [{code, date, open, high, low, close, volume, period}, ...]
+    """
+    conn = _connect()
+    query = (
+        "SELECT code, date, open, high, low, close, volume, period "
+        "FROM klines WHERE code=? AND period=? "
+    )
+    params = [code, period]
+
+    if start_date:
+        query += "AND date >= ? "
+        params.append(start_date)
+    if end_date:
+        query += "AND date <= ? "
+        params.append(end_date)
+
+    query += "ORDER BY date ASC"
+
+    if days is not None:
+        # 用子查询取最后N条
+        query = (
+            "SELECT code, date, open, high, low, close, volume, period "
+            "FROM (SELECT * FROM klines WHERE code=? AND period=? "
+        )
+        if start_date:
+            query += "AND date >= ? "
+        if end_date:
+            query += "AND date <= ? "
+        query += "ORDER BY date DESC LIMIT ?) ORDER BY date ASC"
+        params.append(days)
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [{
+        "code": r["code"], "date": r["date"],
+        "open": r["open"], "high": r["high"],
+        "low": r["low"], "close": r["close"],
+        "volume": r["volume"], "period": r["period"],
+    } for r in rows]
+
+
+def get_latest_kline_date(code: str, period: str = "daily") -> str | None:
+    """获取某股票某周期最新的K线日期"""
+    conn = _connect()
+    row = conn.execute(
+        "SELECT MAX(date) as latest FROM klines WHERE code=? AND period=?",
+        (code, period),
+    ).fetchone()
+    conn.close()
+    return row["latest"] if row else None
+
+
+def get_kline_count(code: str = "", period: str = "daily") -> int:
+    """获取K线数量，可指定股票和周期"""
+    conn = _connect()
+    if code:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM klines WHERE code=? AND period=?",
+            (code, period),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM klines"
+        ).fetchone()
+    conn.close()
+    return row["cnt"] if row else 0

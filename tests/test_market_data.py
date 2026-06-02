@@ -5,7 +5,7 @@ from data.database import save_stock_names_batch, get_stock_names_count
 from data.market_data import (
     search_stock, sync_stock_names_from_api,
     _add_market_prefix,
-    fetch_kline, _normalize_sina_code,
+    fetch_kline,
 )
 
 
@@ -23,11 +23,6 @@ class TestCodePrefix:
 
     def test_already_prefixed(self):
         assert _add_market_prefix("sz000001") == "sz000001"
-
-    def test_normalize_sina_code(self):
-        assert _normalize_sina_code("sz000001") == "000001"
-        assert _normalize_sina_code("sh600519") == "600519"
-        assert _normalize_sina_code("000001") == "000001"
 
 
 class TestSearchLocalDB:
@@ -234,7 +229,7 @@ class TestIncrementalRefreshWorker:
 class TestInitialFetchWorker:
     """新股全量数据获取 — 独立于增量刷新"""
 
-    def test_worker_fetches_all_periods(self):
+    def test_worker_fetches_all_periods(self, temp_db):
         from data.market_data import InitialFetchWorker
         from PyQt5.QtWidgets import QApplication
         from PyQt5.QtCore import QEventLoop, QTimer
@@ -256,7 +251,7 @@ class TestInitialFetchWorker:
         assert "daily" in periods_received
         assert len(klines_by_period.get("daily", [])) > 0
 
-    def test_async_isolation(self):
+    def test_async_isolation(self, temp_db):
         """增量刷新和新股全量可以同时运行 (不同QThread)"""
         from data.market_data import IncrementalRefreshWorker, InitialFetchWorker
         import time

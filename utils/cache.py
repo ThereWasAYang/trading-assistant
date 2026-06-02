@@ -71,9 +71,6 @@ class TTLCache:
 # 全局缓存实例
 # ============================================================
 
-# 实时行情缓存 (5秒过期，因为数据更新频率高)
-_quotes_cache = TTLCache(default_ttl=5.0)
-
 # K线数据缓存 (5分钟过期，K线变化慢)
 _kline_cache = TTLCache(default_ttl=300.0)
 
@@ -82,10 +79,6 @@ _search_cache = TTLCache(default_ttl=600.0)
 
 # 30分钟K线缓存 (2分钟过期)
 _kline_30min_cache = TTLCache(default_ttl=120.0)
-
-
-def get_quotes_cache() -> TTLCache:
-    return _quotes_cache
 
 
 def get_kline_cache() -> TTLCache:

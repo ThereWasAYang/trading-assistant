@@ -1,9 +1,12 @@
 """全局配置常量"""
 
 # 数据刷新
-REALTIME_REFRESH_MS = 30000         # 增量行情刷新间隔 (毫秒, 30秒)
+REALTIME_REFRESH_MS = 60000         # 增量行情刷新间隔 (毫秒, 60秒)
 BUYPOINT_SCAN_INTERVAL_MS = 300000  # 买点扫描间隔 (毫秒, 5分钟)
 KLINE_REFRESH_MS = 60000            # K线数据刷新间隔 (毫秒, 60秒, 仅当前查看的股票)
+KLINE_FLUSH_INTERVAL_SEC = 300      # 内存K线 flush 到 DB 间隔 (秒, 5分钟)
+KLINE_CACHE_TTL_SEC = 60            # 内存K线缓存TTL (秒)
+KLINE_INITIAL_MONTHS = 6            # 新股初始获取历史数据月数
 DAILY_STOP_LOSS_HOUR = 15           # 每日止损更新时间 (15点收盘)
 DAILY_STOP_LOSS_MINUTE = 5          # 收盘后5分钟触发
 

@@ -263,3 +263,92 @@ class TestStockNames:
         assert get_stock_names_count() == 0
         save_stock_names_batch([{"code": "000001", "name": "平安银行"}])
         assert get_stock_names_count() == 1
+
+
+class TestKLines:
+    """测试K线数据持久化"""
+
+    def test_save_and_get_klines(self, temp_db):
+        from data.database import save_klines_batch, get_klines, get_kline_count
+        bars = [
+            {"code": "000001", "date": "2026-06-01", "open": 10.0, "high": 10.5,
+             "low": 9.8, "close": 10.2, "volume": 100000, "period": "daily"},
+            {"code": "000001", "date": "2026-06-02", "open": 10.2, "high": 10.8,
+             "low": 10.1, "close": 10.5, "volume": 120000, "period": "daily"},
+            {"code": "000001", "date": "2026-06-03", "open": 10.5, "high": 11.0,
+             "low": 10.3, "close": 10.8, "volume": 150000, "period": "daily"},
+        ]
+        count = save_klines_batch(bars)
+        assert count == 3
+        assert get_kline_count("000001", "daily") == 3
+
+    def test_get_klines_returns_ascending(self, temp_db):
+        from data.database import save_klines_batch, get_klines
+        bars = [
+            {"code": "000001", "date": "2026-06-03", "open": 10.5, "high": 11.0,
+             "low": 10.3, "close": 10.8, "volume": 150000, "period": "daily"},
+            {"code": "000001", "date": "2026-06-01", "open": 10.0, "high": 10.5,
+             "low": 9.8, "close": 10.2, "volume": 100000, "period": "daily"},
+            {"code": "000001", "date": "2026-06-02", "open": 10.2, "high": 10.8,
+             "low": 10.1, "close": 10.5, "volume": 120000, "period": "daily"},
+        ]
+        save_klines_batch(bars)
+        result = get_klines("000001", "daily")
+        assert len(result) == 3
+        assert result[0]["date"] == "2026-06-01"
+        assert result[2]["date"] == "2026-06-03"
+
+    def test_get_klines_with_days_limit(self, temp_db):
+        from data.database import save_klines_batch, get_klines
+        bars = [
+            {"code": "000001", "date": f"2026-06-{d:02d}", "open": 10.0, "high": 10.5,
+             "low": 9.8, "close": 10.2, "volume": 100000, "period": "daily"}
+            for d in range(1, 16)
+        ]
+        save_klines_batch(bars)
+        result = get_klines("000001", "daily", days=5)
+        assert len(result) == 5
+        assert result[0]["date"] == "2026-06-11"
+        assert result[-1]["date"] == "2026-06-15"
+
+    def test_upsert_same_date_updates(self, temp_db):
+        from data.database import save_klines_batch, get_klines
+        bar1 = [
+            {"code": "000001", "date": "2026-06-01", "open": 10.0, "high": 10.5,
+             "low": 9.8, "close": 10.2, "volume": 100000, "period": "daily"},
+        ]
+        save_klines_batch(bar1)
+        bar2 = [
+            {"code": "000001", "date": "2026-06-01", "open": 10.2, "high": 11.0,
+             "low": 10.1, "close": 10.8, "volume": 150000, "period": "daily"},
+        ]
+        save_klines_batch(bar2)
+        result = get_klines("000001", "daily")
+        assert len(result) == 1
+        assert result[0]["close"] == 10.8  # 第二次写入的值
+
+    def test_get_latest_date(self, temp_db):
+        from data.database import save_klines_batch, get_latest_kline_date
+        bars = [
+            {"code": "000001", "date": "2026-05-15", "open": 10.0, "high": 10.5,
+             "low": 9.8, "close": 10.2, "volume": 100000, "period": "daily"},
+            {"code": "000001", "date": "2026-06-01", "open": 10.2, "high": 10.8,
+             "low": 10.1, "close": 10.5, "volume": 120000, "period": "daily"},
+        ]
+        save_klines_batch(bars)
+        assert get_latest_kline_date("000001", "daily") == "2026-06-01"
+
+    def test_different_periods_separate(self, temp_db):
+        from data.database import save_klines_batch, get_klines
+        daily = [
+            {"code": "000001", "date": "2026-06-01", "open": 10.0, "high": 10.5,
+             "low": 9.8, "close": 10.2, "volume": 100000, "period": "daily"},
+        ]
+        weekly = [
+            {"code": "000001", "date": "2026-06-01", "open": 10.0, "high": 10.5,
+             "low": 9.8, "close": 10.2, "volume": 100000, "period": "weekly"},
+        ]
+        save_klines_batch(daily)
+        save_klines_batch(weekly)
+        assert len(get_klines("000001", "daily")) == 1
+        assert len(get_klines("000001", "weekly")) == 1
