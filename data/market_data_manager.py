@@ -94,6 +94,51 @@ class MarketDataManager:
             return dict(self._quotes)
 
     # ================================================================
+    # 启动初始化
+    # ================================================================
+
+    def startup_load_quotes(self, codes: list[str]) -> int:
+        """启动时从DB的日线末尾加载现价到内存缓存（冷启动，无API调用）
+        返回成功加载的股票数量
+        """
+        loaded = 0
+        for code in codes:
+            try:
+                db_dicts = db_get_klines(code, "daily", days=2)
+                if not db_dicts:
+                    continue
+
+                last = db_dicts[-1]
+                price = last["close"]
+                pre_close = price
+                if len(db_dicts) >= 2:
+                    pre_close = db_dicts[-2]["close"]
+
+                change_pct = ((price - pre_close) / pre_close * 100) if pre_close > 0 else 0.0
+                quote = RealtimeQuote(
+                    code=code,
+                    name="",
+                    price=round(price, 2),
+                    change_pct=round(change_pct, 2),
+                    change_amt=round(price - pre_close, 2),
+                    volume=last.get("volume", 0),
+                    high=last.get("high", 0),
+                    low=last.get("low", 0),
+                    open=last.get("open", 0),
+                    pre_close=round(pre_close, 2),
+                    timestamp=last["date"],
+                )
+                with self._quotes_lock:
+                    self._quotes[code] = quote
+                loaded += 1
+            except Exception as e:
+                logger.debug(f"启动加载 {code} 现价失败: {e}")
+
+        if loaded > 0:
+            logger.info(f"启动加载: {loaded}/{len(codes)} 只股票现价从DB恢复")
+        return loaded
+
+    # ================================================================
     # 今日 bar
     # ================================================================
 
@@ -214,7 +259,6 @@ class MarketDataManager:
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        half_year_ago = (datetime.now() - timedelta(days=190)).strftime("%Y%m%d")
         periods = ["daily", "weekly", "monthly"]
         days_map = {"daily": 126, "weekly": 52, "monthly": 12}
         results = {}
@@ -222,6 +266,8 @@ class MarketDataManager:
         self.mark_pending(code)
 
         try:
+            # 第一阶段: 并行拉取 (纯 API 调用，不写 DB)
+            klines_by_period = {}
             with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = {
                     executor.submit(fetch_kline, code, p, days_map[p]): p
@@ -231,52 +277,63 @@ class MarketDataManager:
                     period = futures[future]
                     try:
                         klines = future.result()
-                        # 转换为 dict 列表存DB
-                        kline_dicts = [
-                            {
-                                "code": k.code, "date": k.date,
-                                "open": k.open, "high": k.high,
-                                "low": k.low, "close": k.close,
-                                "volume": k.volume, "period": k.period,
-                            }
-                            for k in klines
-                        ]
-                        if kline_dicts:
-                            save_klines_batch(kline_dicts)
-                            logger.info(f"已存储 {code} {period} K线 {len(kline_dicts)} 条")
+                        klines_by_period[period] = klines
 
-                            # 日线存库后，立即用最后一条K线更新现价缓存
-                            if period == "daily" and klines and len(klines) >= 2:
-                                last = klines[-1]
-                                prev = klines[-2]
-                                price = last.close
-                                pre_close = prev.close
-                                change_pct = ((price - pre_close) / pre_close * 100) if pre_close > 0 else 0.0
-                                quote = RealtimeQuote(
-                                    code=code,
-                                    name="",
-                                    price=price,
-                                    change_pct=round(change_pct, 2),
-                                    change_amt=round(price - pre_close, 2),
-                                    volume=last.volume,
-                                    high=last.high,
-                                    low=last.low,
-                                    open=last.open,
-                                    pre_close=round(pre_close, 2),
-                                    timestamp=datetime.now().strftime("%H:%M:%S"),
-                                )
-                                with self._quotes_lock:
-                                    self._quotes[code] = quote
-                                logger.debug(f"初始获取后更新现价: {code} = {price:.2f}")
-
-                        results[period] = kline_dicts
-
-                        if kline_callback:
+                        # 先发信号通知图表 (数据已在内存)
+                        if kline_callback and klines:
                             kline_callback(code, period, klines)
 
                     except Exception as e:
                         logger.error(f"初始获取 {code} {period} K线失败: {e}")
-                        results[period] = []
+                        klines_by_period[period] = []
+
+            # 第二阶段: 串行写 DB (避免并发写冲突)
+            all_dicts = []
+            daily_klines = None
+            for period in periods:
+                klines = klines_by_period.get(period, [])
+                kline_dicts = [
+                    {
+                        "code": k.code, "date": k.date,
+                        "open": k.open, "high": k.high,
+                        "low": k.low, "close": k.close,
+                        "volume": k.volume, "period": k.period,
+                    }
+                    for k in klines
+                ]
+                results[period] = kline_dicts
+                all_dicts.extend(kline_dicts)
+                if period == "daily":
+                    daily_klines = klines
+
+            # 一次性批量写 DB
+            if all_dicts:
+                try:
+                    save_klines_batch(all_dicts)
+                    logger.info(f"已存储 {code} K线 {len(all_dicts)} 条 (日/周/月)")
+                except Exception as e:
+                    logger.error(f"存储 {code} K线到DB失败: {e}")
+
+            # 日线末条 → 现价缓存
+            if daily_klines and len(daily_klines) >= 2:
+                last = daily_klines[-1]
+                prev = daily_klines[-2]
+                price = last.close
+                pre_close = prev.close
+                change_pct = ((price - pre_close) / pre_close * 100) if pre_close > 0 else 0.0
+                quote = RealtimeQuote(
+                    code=code, name="",
+                    price=price,
+                    change_pct=round(change_pct, 2),
+                    change_amt=round(price - pre_close, 2),
+                    volume=last.volume,
+                    high=last.high, low=last.low,
+                    open=last.open,
+                    pre_close=round(pre_close, 2),
+                    timestamp=datetime.now().strftime("%H:%M:%S"),
+                )
+                with self._quotes_lock:
+                    self._quotes[code] = quote
 
             # 清除缓存让下次读取走DB
             self._invalidate_kline_cache(code)

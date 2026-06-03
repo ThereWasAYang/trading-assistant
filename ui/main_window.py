@@ -33,6 +33,8 @@ from data.market_data_manager import get_data_manager
 from data.models import RealtimeQuote, Group, Stock
 from core.alert_engine import AlertEngine
 from core.buy_point_scanner import BuyPointScanWorker
+import traceback
+
 from utils import is_trading_time
 from utils.logger import get_logger
 
@@ -76,8 +78,8 @@ class MainWindow(QMainWindow):
         self._setup_timers()
         self._load_groups()
 
-        # 初始刷新
-        self._refresh_current_group_data()
+        # 启动初始化: 从DB加载现价，交易时段额外触发API刷新
+        self._startup_initialize()
 
         logger.info("主窗口初始化完成")
 
@@ -251,6 +253,29 @@ class MainWindow(QMainWindow):
                 self.style().SP_MessageBoxWarning
             ))
         self._tray_flash_on = not self._tray_flash_on
+
+    # ================================================================
+    # 启动初始化
+    # ================================================================
+
+    def _startup_initialize(self):
+        """启动时初始化所有跟踪股票的数据
+
+        开盘:  DB加载现价 → 表格立即显示 → API实时刷新覆盖
+        非开盘: DB加载现价 → 表格显示最后交易日收盘，不调API
+        """
+        codes = self._get_all_tracked_codes()
+        if codes:
+            loaded = self.data_manager.startup_load_quotes(codes)
+            logger.info(
+                f"启动加载完成: {loaded}/{len(codes)} 只股票, "
+                f"{'交易时段，触发实时刷新' if is_trading_time() else '非交易时段，使用DB收盘数据'}"
+            )
+
+        self._refresh_table_display()
+
+        if is_trading_time():
+            self._refresh_current_group_data()
 
     # ================================================================
     # 定时器
@@ -818,14 +843,18 @@ class MainWindow(QMainWindow):
         self._init_worker.start()
 
     def _on_new_stock_kline_ready(self, code: str, period: str, klines: list):
-        """新股某周期K线到达 → 更新图表 (如果正在查看)"""
-        if code == self._current_stock_code:
+        """新股某周期K线到达 → 更新图表 (如果正在查看该股票)"""
+        if not klines or code != self._current_stock_code:
+            return
+        try:
             for i in range(self.chart_widget.tabs.count()):
                 tab = self.chart_widget.tabs.widget(i)
-                if hasattr(tab, 'period') and tab.period == period:
+                if hasattr(tab, 'period') and tab.period == period and tab.code == code:
                     tab.klines = klines
                     tab._draw_kline()
                     break
+        except Exception:
+            logger.warning(f"新股K线绘图失败 ({code}, {period}):\n{traceback.format_exc()}")
 
     def _on_new_stock_init_done(self, code: str):
         """新股全量数据获取完成 → 刷新表格显示（现价已由Manager写入）"""

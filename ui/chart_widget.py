@@ -63,9 +63,20 @@ class ChartTabWidget(QWidget):
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas)
 
-    def load_data(self, code: str):
-        """加载指定股票的图表数据"""
+    def load_data(self, code: str, force_reload: bool = False):
+        """加载指定股票的图表数据（优先内存，同股票不重复拉取）"""
+        # 同股票且已有数据 → 直接重绘，不走 Worker
+        if code == self.code and not force_reload:
+            if self.period == "intraday" and self.intraday_data:
+                self._draw_intraday()
+                return
+            elif self.klines:
+                self._draw_kline()
+                return
+
         self.code = code
+        self.klines = []
+        self.intraday_data = []
         if self.period == "intraday":
             self._load_intraday()
         else:
@@ -82,7 +93,12 @@ class ChartTabWidget(QWidget):
         if code != self.code:
             return
         self.intraday_data = data
-        self._draw_intraday()
+        try:
+            self._draw_intraday()
+        except Exception:
+            import traceback
+            from utils.logger import get_logger
+            get_logger(__name__).warning(f"绘制分时图失败 ({code}):\n{traceback.format_exc()}")
 
     def _load_kline(self):
         """加载K线数据"""
@@ -97,14 +113,19 @@ class ChartTabWidget(QWidget):
         if code != self.code or period != self.period:
             return
         self.klines = klines
-        self._draw_kline()
+        try:
+            self._draw_kline()
+        except Exception:
+            import traceback
+            from utils.logger import get_logger
+            get_logger(__name__).warning(f"绘制K线图失败 ({code}, {period}):\n{traceback.format_exc()}")
 
     # ================================================================
     # 图表绘制
     # ================================================================
 
     def _draw_intraday(self):
-        """绘制分时图"""
+        """绘制分时图 — X轴按天分组标注日期"""
         self.canvas.fig.clear()
 
         if not self.intraday_data:
@@ -112,45 +133,65 @@ class ChartTabWidget(QWidget):
             return
 
         times = [d["time"] for d in self.intraday_data]
+        dates = [d.get("date", t[:10]) for d, t in zip(self.intraday_data, times)]
         prices = [d["price"] for d in self.intraday_data]
         avg_prices = [d["avg_price"] for d in self.intraday_data]
         volumes = [d["volume"] for d in self.intraday_data]
+        n = len(prices)
 
-        # 上栏: 价格走势
+        # 找出日期切换点 (day transition indices)
+        day_boundaries = [0]  # 每段开始的index
+        day_labels = [dates[0]] if dates else []
+        for i in range(1, n):
+            if dates[i] != dates[i - 1]:
+                day_boundaries.append(i)
+                day_labels.append(dates[i])
+        day_boundaries.append(n)  # 结束位置
+
+        # 上栏: 价格走势 (连续线，天之间用竖线分隔)
         ax1 = self.canvas.fig.add_subplot(2, 1, 1)
-        ax1.plot(range(len(prices)), prices, color="#333333", linewidth=1.0, label="价格")
-        ax1.plot(range(len(avg_prices)), avg_prices, color="#FFA500",
+
+        x_all = list(range(n))
+        ax1.plot(x_all, prices, color="#333333", linewidth=1.0, label="价格")
+        ax1.plot(x_all, avg_prices, color="#FFA500",
                  linewidth=0.8, linestyle="--", label="均价")
 
-        # 标注昨收
+        # 日期分隔线和标签
+        tick_positions = [0]
+        tick_labels = [day_labels[0][5:]]
+        for di in range(1, len(day_labels)):
+            boundary = day_boundaries[di]
+            tick_positions.append(boundary)
+            tick_labels.append(day_labels[di][5:])
+            ax1.axvline(x=boundary - 0.5, color="#CCCCCC", linewidth=0.5, linestyle=":")
+
+        # 昨收线 (从日线取)
+        pre_close = 0
         if self.klines:
             pre_close = self.klines[-1].close
         elif prices:
             pre_close = prices[0]
-        else:
-            pre_close = 0
         if pre_close > 0:
             ax1.axhline(y=pre_close, color="#999999", linewidth=0.5, linestyle="-.")
 
         ax1.set_ylabel("价格")
         ax1.legend(loc="upper left", fontsize=8)
         ax1.grid(True, alpha=0.3)
+        ax1.set_xticks(tick_positions)
+        ax1.set_xticklabels(tick_labels, fontsize=8)
 
-        # 设置x轴标签
-        step = max(1, len(times) // 8)
-        tick_positions = list(range(0, len(times), step))
-        tick_labels = [times[i] for i in tick_positions if i < len(times)]
-        ax1.set_xticks(tick_positions[:len(tick_labels)])
-        ax1.set_xticklabels(tick_labels, rotation=30, fontsize=7)
-
-        # 下栏: 成交量
+        # 下栏: 成交量 (连续，天之间竖线分隔)
         ax2 = self.canvas.fig.add_subplot(2, 1, 2)
         colors_vol = ["#DC143C" if i > 0 and prices[i] >= prices[i - 1]
-                      else "#008000" for i in range(len(prices))]
-        ax2.bar(range(len(volumes)), volumes, color=colors_vol, width=1.0)
+                      else "#008000" for i in range(n)]
+        ax2.bar(range(n), volumes, color=colors_vol, width=1.0)
+
+        for di in range(1, len(day_labels)):
+            ax2.axvline(x=day_boundaries[di] - 0.5, color="#CCCCCC", linewidth=0.5, linestyle=":")
+
         ax2.set_ylabel("成交量")
-        ax2.set_xticks(tick_positions[:len(tick_labels)])
-        ax2.set_xticklabels(tick_labels, rotation=30, fontsize=7)
+        ax2.set_xticks(tick_positions)
+        ax2.set_xticklabels(tick_labels, fontsize=8)
         ax2.grid(True, alpha=0.3)
 
         ax1.set_title(f"{self.code} 分时图", fontsize=12, fontweight="bold")
@@ -364,10 +405,24 @@ class ChartWidget(QWidget):
         self.monthly_tab.load_data(code)
 
     def refresh_current_tab(self, code: str):
-        """仅刷新当前显示的周期数据 (定时刷新用，减少API调用)"""
+        """定时刷新当前Tab — 日线/周线/月线从Manager内存取，分时重绘已有数据"""
         current = self.tabs.currentWidget()
-        if current and hasattr(current, 'load_data'):
-            current.load_data(code)
+        if not current or not hasattr(current, 'period'):
+            return
+
+        if current.period == "intraday":
+            # 分时: 强制重拉(盘中数据实时变化)
+            current.load_data(code, force_reload=True)
+        elif current.klines:
+            # K线: 从Manager读最新缓存(内存) → 重绘
+            from data.market_data_manager import get_data_manager
+            manager = get_data_manager()
+            days_map = {"daily": 250, "weekly": 100, "monthly": 60}
+            days = days_map.get(current.period, 250)
+            updated = manager.get_klines(code, current.period, days)
+            if updated:
+                current.klines = updated
+                current._draw_kline()
 
     def set_alert_lines(self, stop_loss: float, take_profit: float):
         """设置所有周期图表的止损止盈线"""

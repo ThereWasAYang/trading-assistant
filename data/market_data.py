@@ -201,9 +201,10 @@ def fetch_intraday_data(code: str) -> list[dict]:
 
     try:
         import akshare as ak
-        logger.debug(f"获取分时数据: {code}")
+        sina_code = _add_market_prefix(code)
+        logger.debug(f"获取分时数据: {code} ({sina_code})")
 
-        df = ak.stock_zh_a_minute(symbol=code, period="1")
+        df = ak.stock_zh_a_minute(symbol=sina_code, period="1")
 
         if df is None or df.empty:
             return []
@@ -212,14 +213,20 @@ def fetch_intraday_data(code: str) -> list[dict]:
         cum_vol = 0
         cum_amt = 0.0
         for _, row in df.iterrows():
-            price = _safe_float(row.get("收盘"))
-            vol = _safe_int(row.get("成交量"))
+            price = _safe_float(row.get("close"))
+            vol = _safe_int(row.get("volume"))
             cum_vol += vol
             cum_amt += price * vol
             avg_price = cum_amt / cum_vol if cum_vol > 0 else price
 
+            time_str = str(row.get("day", "")) if "day" in df.columns else str(row.name)
+            # 保留完整 datetime，格式 "2026-06-03 14:30:00"
+            if len(time_str) > 16:
+                time_str = time_str[:19]
+
             result.append({
-                "time": str(row.get("时间", "")) if "时间" in df.columns else str(row.name),
+                "time": time_str,
+                "date": time_str[:10],  # YYYY-MM-DD 用于分组
                 "price": price,
                 "volume": vol,
                 "avg_price": round(avg_price, 2),
